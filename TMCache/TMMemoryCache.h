@@ -159,6 +159,19 @@ typedef void (^TMMemoryCacheObjectBlock)(TMMemoryCache *cache, NSString *key, id
 - (void)setObject:(id)object forKey:(NSString *)key withCost:(NSUInteger)cost block:(TMMemoryCacheObjectBlock)block;
 
 /**
+ Stores an object in the cache for the specified key and the specified cost. If the cost causes the total
+ to go over the <costLimit> the cache is trimmed (oldest objects first). This method returns immediately
+ and executes the passed block after the object has been stored, potentially in parallel with other blocks
+ on the <queue>.
+ 
+ @param object An object to store in the cache.
+ @param key A key to associate with the object. This string will be copied.
+ @param lifetime A integer to specify the lifetime of the object, object exceed its lifetime will be expired
+ @param block A block to be executed serially after the object has been stored, or nil.
+ */
+- (void)setObject:(id)object forKey:(NSString *)key withCost:(NSUInteger)cost lifetime:(NSUInteger)lifetime block:(TMMemoryCacheObjectBlock)block;
+
+/**
  Removes the object for the specified key. This method returns immediately and executes the passed
  block after the object has been removed, potentially in parallel with other blocks on the <queue>.
  
@@ -247,6 +260,18 @@ typedef void (^TMMemoryCacheObjectBlock)(TMMemoryCache *cache, NSString *key, id
  @param cost An amount to add to the <totalCost>.
  */
 - (void)setObject:(id)object forKey:(NSString *)key withCost:(NSUInteger)cost;
+
+/**
+ Stores an object in the cache for the specified key and the specified cost. If the cost causes the total
+ to go over the <costLimit> the cache is trimmed (oldest objects first). This method blocks the calling thread
+ until the object has been stored.
+ 
+ @param object An object to store in the cache.
+ @param key A key to associate with the object. This string will be copied.
+ @param cost An amount to add to the <totalCost>.
+ @param lifetime The lifetime length in second of this object. Object exceed its lifetime will be expired and removed from the cache.
+ */
+- (void)setObject:(id)object forKey:(NSString *)key withCost:(NSUInteger)cost lifetime:(NSUInteger)lifetime;
 
 /**
  Removes the object for the specified key. This method blocks the calling thread until the object

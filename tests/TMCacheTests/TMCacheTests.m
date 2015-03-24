@@ -326,4 +326,173 @@ NSTimeInterval TMCacheTestBlockTimeout = 5.0;
     STAssertTrue(objectCount == enumCount, @"some objects were not enumerated");
 }
 
+- (void)testMemoryCacheObjectLifetimeExpiration
+{
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    
+    dispatch_queue_t queue = dispatch_queue_create(NULL, DISPATCH_QUEUE_SERIAL);
+    
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    
+    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC), 0);
+    
+    __block int secondPassed = -1;
+    dispatch_source_set_event_handler(timer, ^{
+        secondPassed ++;
+        NSLog(@"second passed: %ld", secondPassed);
+        
+        //NSLog(@"key1 : %@", [self.cache.memoryCache objectForKey:@"key1"]);
+        //NSLog(@"key2 : %@", [self.cache.memoryCache objectForKey:@"key2"]);
+        
+        if(secondPassed == 0){
+            STAssertTrue([self.cache.memoryCache objectForKey:@"key1"] != nil, @"object related to key1 is unexpected expired");
+            STAssertTrue([self.cache.memoryCache objectForKey:@"key2"] != nil, @"object related to key2 is unexpected expired");
+        }
+        else if(secondPassed == 2){
+            STAssertTrue([self.cache.memoryCache objectForKey:@"key1"] == nil, @"object related to key1 should be expired");
+            STAssertTrue([self.cache.memoryCache objectForKey:@"key2"] != nil, @"object related to key2 is unexpected expired");
+        }
+        else if(secondPassed == 4){
+            STAssertTrue([self.cache.memoryCache objectForKey:@"key1"] == nil, @"object related to key1 should be expired");
+            STAssertTrue([self.cache.memoryCache objectForKey:@"key2"] == nil, @"object related to key2 should be expired");
+            dispatch_semaphore_signal(semaphore);
+        }
+    });
+    
+    [self.cache.memoryCache setObject:@"obj1" forKey:@"key1" withCost:0 lifetime:1];
+    [self.cache.memoryCache setObject:@"obj2" forKey:@"key2" withCost:0 lifetime:3];
+    
+    dispatch_resume(timer);
+    
+    dispatch_semaphore_wait(semaphore, [self timeout]);
+}
+
+- (void)testMemoryCacheObjectLifetimeActiveExpiration
+{
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    
+    dispatch_queue_t queue = dispatch_queue_create(NULL, DISPATCH_QUEUE_SERIAL);
+    
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    
+    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC), 0);
+    
+    __block int secondPassed = -1;
+    dispatch_source_set_event_handler(timer, ^{
+        secondPassed ++;
+        //NSLog(@"second passed: %ld", secondPassed);
+        
+        //NSLog(@"key1 : %@", [self.cache.memoryCache objectForKey:@"key1"]);
+        //NSLog(@"cache total cost : %d", self.cache.memoryCache.totalCost);
+        
+        if(secondPassed == 0){
+            STAssertTrue(self.cache.memoryCache.totalCost == 100, @"No objects should be expired now");
+        }
+        else if(secondPassed == 2){
+            STAssertTrue(self.cache.memoryCache.totalCost == 90, @"10 objects should be expired now");
+            dispatch_semaphore_signal(semaphore);
+        }
+        else if(secondPassed == 10){
+            STAssertTrue(self.cache.memoryCache.totalCost == 60, @"All objects should be expired now");
+            dispatch_semaphore_signal(semaphore);
+        }
+    });
+    
+    int objectCount = 100;
+    for(int i=0;i< objectCount; i++){
+        NSString *key = [[NSString alloc] initWithFormat:@"key%d", i];
+        NSString *obj = [[NSString alloc] initWithFormat:@"obj%d", i];
+        [self.cache.memoryCache setObject:obj forKey:key withCost:1 lifetime:i / 10];
+    }
+    
+    dispatch_resume(timer);
+    
+    dispatch_semaphore_wait(semaphore, [self timeout]);
+}
+
+
+- (void)testDiskCacheObjectLifetimeExpiration
+{
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    
+    dispatch_queue_t queue = dispatch_queue_create(NULL, DISPATCH_QUEUE_SERIAL);
+    
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    
+    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC), 0);
+    
+    __block int secondPassed = -1;
+    dispatch_source_set_event_handler(timer, ^{
+        secondPassed ++;
+        NSLog(@"second passed: %ld", secondPassed);
+        
+        NSLog(@"key1 : %@", [self.cache.diskCache objectForKey:@"key1"]);
+        NSLog(@"key2 : %@", [self.cache.diskCache objectForKey:@"key2"]);
+        
+        if(secondPassed == 0){
+            STAssertTrue([self.cache.diskCache objectForKey:@"key1"] != nil, @"object related to key1 is unexpected expired");
+            STAssertTrue([self.cache.diskCache objectForKey:@"key2"] != nil, @"object related to key2 is unexpected expired");
+        }
+        else if(secondPassed == 2){
+            STAssertTrue([self.cache.diskCache objectForKey:@"key1"] == nil, @"object related to key1 should be expired");
+            STAssertTrue([self.cache.diskCache objectForKey:@"key2"] != nil, @"object related to key2 is unexpected expired");
+        }
+        else if(secondPassed == 4){
+            STAssertTrue([self.cache.diskCache objectForKey:@"key1"] == nil, @"object related to key1 should be expired");
+            STAssertTrue([self.cache.diskCache objectForKey:@"key2"] == nil, @"object related to key2 should be expired");
+            dispatch_semaphore_signal(semaphore);
+        }
+    });
+    
+    [self.cache.diskCache setObject:@"obj1" forKey:@"key1" withLifetime:1];
+    [self.cache.diskCache setObject:@"obj2" forKey:@"key2" withLifetime:3];
+    
+    dispatch_resume(timer);
+    
+    dispatch_semaphore_wait(semaphore, [self timeout]);
+}
+
+- (void)testDiskCacheObjectLifetimeActiveExpiration
+{
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    
+    dispatch_queue_t queue = dispatch_queue_create(NULL, DISPATCH_QUEUE_SERIAL);
+    
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    
+    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC), 0);
+    
+    __block int secondPassed = -1;
+    dispatch_source_set_event_handler(timer, ^{
+        secondPassed ++;
+        //NSLog(@"second passed: %ld", secondPassed);
+        
+        //NSLog(@"key1 : %@", [self.cache.diskCache objectForKey:@"key1"]);
+        NSLog(@"cache total cost : %d", self.cache.diskCache.byteCount);
+        
+        if(secondPassed == 0){
+            STAssertTrue(self.cache.diskCache.byteCount == 100 * 4096, @"No objects should be expired now");
+        }
+        else if(secondPassed == 2){
+            STAssertTrue(self.cache.diskCache.byteCount < 100 * 4096 , @"10 objects should be expired now");
+            dispatch_semaphore_signal(semaphore);
+        }
+        else if(secondPassed == 3){
+            STAssertTrue(self.cache.diskCache.byteCount < 70 * 4096, @"All objects should be expired now");
+            dispatch_semaphore_signal(semaphore);
+        }
+    });
+    
+    int objectCount = 100;
+    for(int i=0;i< objectCount; i++){
+        NSString *key = [[NSString alloc] initWithFormat:@"key%d", i];
+        NSString *obj = @"obj";
+        [self.cache.diskCache setObject:obj forKey:key withLifetime:i/3];
+    }
+    
+    dispatch_resume(timer);
+    
+    dispatch_semaphore_wait(semaphore, [self timeout]);
+}
+
 @end

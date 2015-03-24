@@ -6,6 +6,10 @@
 
 NSString * const TMMemoryCachePrefix = @"com.tumblr.TMMemoryCache";
 
+static NSTimeInterval const kExpireCheckInterval = 0.1;
+static int const kExpireLookupsPerLoop = 20;
+static float const kExpirePercentageThresholdPerLoop = 0.25;
+
 @interface TMMemoryCache ()
 #if OS_OBJECT_USE_OBJC
 @property (strong, nonatomic) dispatch_queue_t queue;
@@ -15,6 +19,7 @@ NSString * const TMMemoryCachePrefix = @"com.tumblr.TMMemoryCache";
 @property (strong, nonatomic) NSMutableDictionary *dictionary;
 @property (strong, nonatomic) NSMutableDictionary *dates;
 @property (strong, nonatomic) NSMutableDictionary *costs;
+@property (strong, nonatomic) NSMutableDictionary *expireTimes;
 @end
 
 @implementation TMMemoryCache
@@ -52,6 +57,7 @@ NSString * const TMMemoryCachePrefix = @"com.tumblr.TMMemoryCache";
         _dictionary = [[NSMutableDictionary alloc] init];
         _dates = [[NSMutableDictionary alloc] init];
         _costs = [[NSMutableDictionary alloc] init];
+        _expireTimes = [[NSMutableDictionary alloc] init];
 
         _willAddObjectBlock = nil;
         _willRemoveObjectBlock = nil;
@@ -148,6 +154,7 @@ NSString * const TMMemoryCachePrefix = @"com.tumblr.TMMemoryCache";
     [_dictionary removeObjectForKey:key];
     [_dates removeObjectForKey:key];
     [_costs removeObjectForKey:key];
+    [_expireTimes removeObjectForKey:key];
 
     if (_didRemoveObjectBlock)
         _didRemoveObjectBlock(self, key, nil);
@@ -225,12 +232,79 @@ NSString * const TMMemoryCachePrefix = @"com.tumblr.TMMemoryCache";
     });
 }
 
+- (void)trimExpiredObjects
+{
+    for(int i=0; i< [_expireTimes.allKeys count]; i++){
+        NSString *key = [_expireTimes.allKeys objectAtIndex:i];
+        
+        NSDate *now = [NSDate date];
+        NSDate *expireTime = [_expireTimes objectForKey:key];
+        
+        if([expireTime compare:now] == NSOrderedAscending){
+            //NSLog(@"expired object cleaned %@", key);
+            [self removeObjectAndExecuteBlocksForKey:key];
+        }
+    }
+}
+
+- (void)trimExpiredObjectsBySampling
+{
+    while(true){
+        NSUInteger expireObjecCount = 0;
+        for(int i=0; i< kExpireLookupsPerLoop && i < [_expireTimes.allKeys count]; i++){
+            NSUInteger len = [_expireTimes.allKeys count];
+            NSUInteger index = arc4random() % len;
+            NSString *key = [_expireTimes.allKeys objectAtIndex:index];
+            
+            NSDate *now = [NSDate date];
+            NSDate *expireTime = [_expireTimes objectForKey:key];
+            
+            if([expireTime compare:now] == NSOrderedAscending){
+                //NSLog(@"expired object cleaned %@", key);
+                [self removeObjectAndExecuteBlocksForKey:key];
+                expireObjecCount ++;
+            }
+        }
+        
+        if(expireObjecCount < (kExpireLookupsPerLoop * kExpirePercentageThresholdPerLoop)){
+            break;
+        }
+    }
+}
+
+- (void)trimExpiredObjectsRecursively
+{
+    if (_expireTimes.allKeys.count == 0)
+        return;
+    
+    if(_expireTimes.allKeys.count <= kExpireLookupsPerLoop){
+        [self trimExpiredObjects];
+    }
+    else{
+        [self trimExpiredObjectsBySampling];
+    }
+    
+    __weak TMMemoryCache *weakSelf = self;
+    
+    dispatch_time_t time = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kExpireCheckInterval * NSEC_PER_SEC));
+    dispatch_after(time, _queue, ^{
+        TMMemoryCache *strongSelf = weakSelf;
+        if(!strongSelf)
+            return;
+        
+        __weak TMMemoryCache *weakSelf = strongSelf;
+        
+        dispatch_barrier_async(strongSelf->_queue, ^{
+            TMMemoryCache *strongSelf = weakSelf;
+            [strongSelf trimExpiredObjectsRecursively];
+        });
+    });
+}
+
 #pragma mark - Public Asynchronous Methods -
 
 - (void)objectForKey:(NSString *)key block:(TMMemoryCacheObjectBlock)block
 {
-    NSDate *now = [[NSDate alloc] init];
-    
     if (!key || !block)
         return;
 
@@ -240,9 +314,20 @@ NSString * const TMMemoryCachePrefix = @"com.tumblr.TMMemoryCache";
         TMMemoryCache *strongSelf = weakSelf;
         if (!strongSelf)
             return;
-
-        id object = [strongSelf->_dictionary objectForKey:key];
-
+        
+        id object = nil;
+        // lazy mode for expiration
+        NSDate *expireTime = [strongSelf->_expireTimes objectForKey:key];
+        NSDate *now = [[NSDate alloc] init];
+        
+        if(expireTime != nil && [expireTime compare:now] == NSOrderedAscending){
+            [self removeObjectAndExecuteBlocksForKey:key];
+            object = nil;
+        }
+        else{
+            object = [strongSelf->_dictionary objectForKey:key];
+        }
+        
         if (object) {
             __weak TMMemoryCache *weakSelf = strongSelf;
             dispatch_barrier_async(strongSelf->_queue, ^{
@@ -262,6 +347,11 @@ NSString * const TMMemoryCachePrefix = @"com.tumblr.TMMemoryCache";
 }
 
 - (void)setObject:(id)object forKey:(NSString *)key withCost:(NSUInteger)cost block:(TMMemoryCacheObjectBlock)block
+{
+    [self setObject:object forKey:key withCost:cost lifetime:0 block:block];
+}
+
+- (void)setObject:(id)object forKey:(NSString *)key withCost:(NSUInteger)cost lifetime:(NSUInteger)lifetime block:(TMMemoryCacheObjectBlock)block
 {
     NSDate *now = [[NSDate alloc] init];
 
@@ -289,6 +379,14 @@ NSString * const TMMemoryCachePrefix = @"com.tumblr.TMMemoryCache";
 
         if (strongSelf->_costLimit > 0)
             [strongSelf trimToCostByDate:strongSelf->_costLimit block:nil];
+        
+        if (lifetime > 0){
+            NSDate *expireTime = [[NSDate alloc] initWithTimeIntervalSinceNow:lifetime];
+            [strongSelf->_expireTimes setObject:expireTime forKey:key];
+            if(_expireTimes.allKeys.count == 1){
+                [strongSelf trimExpiredObjectsRecursively];
+            }
+        }
 
         if (block) {
             __weak TMMemoryCache *weakSelf = strongSelf;
@@ -415,6 +513,7 @@ NSString * const TMMemoryCachePrefix = @"com.tumblr.TMMemoryCache";
         [strongSelf->_dictionary removeAllObjects];
         [strongSelf->_dates removeAllObjects];
         [strongSelf->_costs removeAllObjects];
+        [strongSelf->_expireTimes removeAllObjects];
         
         strongSelf->_totalCost = 0;
 
@@ -493,17 +592,22 @@ NSString * const TMMemoryCachePrefix = @"com.tumblr.TMMemoryCache";
 
 - (void)setObject:(id)object forKey:(NSString *)key withCost:(NSUInteger)cost
 {
-    if (!object || !key)
+    [self setObject:object forKey:key withCost:cost lifetime:0];
+}
+
+- (void)setObject:(id)object forKey:(NSString *)key withCost:(NSUInteger)cost lifetime:(NSUInteger)lifetime
+{
+    if(!object || !key)
         return;
-
+    
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-
-    [self setObject:object forKey:key withCost:cost block:^(TMMemoryCache *cache, NSString *key, id object) {
+    
+    [self setObject:object forKey:key withCost:cost lifetime:lifetime block:^(TMMemoryCache *cache, NSString *key, id object) {
         dispatch_semaphore_signal(semaphore);
     }];
-
+    
     dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-
+    
     #if !OS_OBJECT_USE_OBJC
     dispatch_release(semaphore);
     #endif

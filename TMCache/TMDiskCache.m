@@ -19,14 +19,21 @@
 #endif
 
 NSString * const TMDiskCachePrefix = @"com.tumblr.TMDiskCache";
+NSString * const TMDiskCacheExpireTimePropertyFileName = @"TMDiskCacheExpireTimeProperties";
 NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
+
+static NSTimeInterval const kExpireCheckInterval = 0.1;
+static int const kExpireLookupsPerLoop = 20;
+static float const kExpirePercentageThresholdPerLoop = 0.25;
 
 @interface TMDiskCache ()
 @property (assign) NSUInteger byteCount;
 @property (strong, nonatomic) NSURL *cacheURL;
+@property (strong, nonatomic) NSURL *expireTimeFileURL;
 @property (assign, nonatomic) dispatch_queue_t queue;
 @property (strong, nonatomic) NSMutableDictionary *dates;
 @property (strong, nonatomic) NSMutableDictionary *sizes;
+@property (strong, nonatomic) NSMutableDictionary *expireTimes;
 @end
 
 @implementation TMDiskCache
@@ -69,16 +76,21 @@ NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
 
         _dates = [[NSMutableDictionary alloc] init];
         _sizes = [[NSMutableDictionary alloc] init];
+        _expireTimes = [[NSMutableDictionary alloc] init];
 
         NSString *pathComponent = [[NSString alloc] initWithFormat:@"%@.%@", TMDiskCachePrefix, _name];
         _cacheURL = [NSURL fileURLWithPathComponents:@[ rootPath, pathComponent ]];
 
+        NSString *cacheExpireTimePropertyComponent = [[NSString alloc]initWithFormat:@"%@.%@", pathComponent, TMDiskCacheExpireTimePropertyFileName];
+        _expireTimeFileURL = [NSURL fileURLWithPathComponents:@[ rootPath, cacheExpireTimePropertyComponent]];
+        
         __weak TMDiskCache *weakSelf = self;
 
         dispatch_async(_queue, ^{
             TMDiskCache *strongSelf = weakSelf;
             [strongSelf createCacheDirectory];
             [strongSelf initializeDiskProperties];
+            [strongSelf initialExpireTimePopertyFile];
         });
     }
     return self;
@@ -250,7 +262,7 @@ NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
 - (void)initializeDiskProperties
 {
     NSUInteger byteCount = 0;
-    NSArray *keys = @[ NSURLContentModificationDateKey, NSURLTotalFileAllocatedSizeKey ];
+    NSArray *keys = @[ NSURLContentModificationDateKey, NSURLTotalFileAllocatedSizeKey];
 
     NSError *error = nil;
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtURL:_cacheURL
@@ -279,6 +291,28 @@ NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
 
     if (byteCount > 0)
         self.byteCount = byteCount; // atomic
+}
+
+-(bool)initialExpireTimePopertyFile
+{
+    if ([[NSFileManager defaultManager] fileExistsAtPath:[_expireTimeFileURL path]]) {
+        id expireTimeProperies;
+        @try {
+            expireTimeProperies = [NSKeyedUnarchiver unarchiveObjectWithFile:[_expireTimeFileURL path]];
+            
+            NSLog(@"expire time file located at : %@", [_expireTimeFileURL path]);
+        }
+        @catch (NSException *exception) {
+            NSError *error = nil;
+            [[NSFileManager defaultManager] removeItemAtPath:[_expireTimeFileURL path] error:&error];
+            TMDiskCacheError(error);
+        }
+        
+        if([expireTimeProperies isKindOfClass:[NSMutableDictionary class]]){
+            _expireTimes = expireTimeProperies;
+            NSLog(@"expire time file loaded : %@", _expireTimes);
+        }
+    }
 }
 
 - (BOOL)setFileModificationDate:(NSDate *)date forURL:(NSURL *)fileURL
@@ -319,12 +353,17 @@ NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
     [TMDiskCache emptyTrash];
 
     NSNumber *byteSize = [_sizes objectForKey:key];
+    NSLog(@"ByteSize for key:%@ is %@", key, byteSize);
     if (byteSize)
         self.byteCount = _byteCount - [byteSize unsignedIntegerValue]; // atomic
 
     [_sizes removeObjectForKey:key];
     [_dates removeObjectForKey:key];
-
+    [_expireTimes removeObjectForKey:key];
+    bool written = [NSKeyedArchiver archiveRootObject:_expireTimes toFile:[_expireTimeFileURL path]];
+    if(!written)
+        return NO;
+    
     if (_didRemoveObjectBlock)
         _didRemoveObjectBlock(self, key, nil, fileURL);
 
@@ -395,11 +434,78 @@ NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
     });
 }
 
+- (void)trimExpiredObjects
+{
+    for(int i=0; i< [_expireTimes.allKeys count]; i++){
+        NSString *key = [_expireTimes.allKeys objectAtIndex:i];
+        
+        NSDate *now = [NSDate date];
+        NSDate *expireTime = [_expireTimes objectForKey:key];
+        
+        if([expireTime compare:now] == NSOrderedAscending){
+            [self removeFileAndExecuteBlocksForKey:key];
+        }
+    }
+}
+
+- (void)trimExpiredObjectsBySampling
+{
+    while(true){
+        NSUInteger expireObjecCount = 0;
+        for(int i=0; i< kExpireLookupsPerLoop && i < [_expireTimes.allKeys count]; i++){
+            NSUInteger len = [_expireTimes.allKeys count];
+            NSUInteger index = arc4random() % len;
+            NSString *key = [_expireTimes.allKeys objectAtIndex:index];
+            
+            NSDate *now = [NSDate date];
+            NSDate *expireTime = [_expireTimes objectForKey:key];
+            
+            if([expireTime compare:now] == NSOrderedAscending){
+                [self removeFileAndExecuteBlocksForKey:key];
+                expireObjecCount ++;
+            }
+        }
+        
+        if(expireObjecCount < (kExpireLookupsPerLoop * kExpirePercentageThresholdPerLoop)){
+            break;
+        }
+    }
+}
+
+- (void)trimExpiredObjectsRecursively
+{
+    NSLog(@"trimExpiredObjectsRecursively triggered");
+    if (_expireTimes.allKeys.count == 0)
+        return;
+    
+    if(_expireTimes.allKeys.count <= kExpireLookupsPerLoop){
+        [self trimExpiredObjects];
+    }
+    else{
+        [self trimExpiredObjectsBySampling];
+    }
+    
+    __weak TMDiskCache *weakSelf = self;
+    
+    dispatch_time_t time = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kExpireCheckInterval * NSEC_PER_SEC));
+    dispatch_after(time, _queue, ^{
+        TMDiskCache *strongSelf = weakSelf;
+        if(!strongSelf)
+            return;
+        
+        __weak TMDiskCache *weakSelf = strongSelf;
+        
+        dispatch_barrier_async(strongSelf->_queue, ^{
+            TMDiskCache *strongSelf = weakSelf;
+            [strongSelf trimExpiredObjectsRecursively];
+        });
+    });
+}
+
 #pragma mark - Public Asynchronous Methods -
 
 - (void)objectForKey:(NSString *)key block:(TMDiskCacheObjectBlock)block
 {
-    NSDate *now = [[NSDate alloc] init];
 
     if (!key || !block)
         return;
@@ -410,21 +516,40 @@ NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
         TMDiskCache *strongSelf = weakSelf;
         if (!strongSelf)
             return;
-
+        
         NSURL *fileURL = [strongSelf encodedFileURLForKey:key];
+        
         id <NSCoding> object = nil;
-
-        if ([[NSFileManager defaultManager] fileExistsAtPath:[fileURL path]]) {
-            @try {
-                object = [NSKeyedUnarchiver unarchiveObjectWithFile:[fileURL path]];
+        // lazy mode for expiration
+        
+        NSDate *now = [[NSDate alloc] init];
+        NSDate *expireTime = [strongSelf->_expireTimes objectForKey:key];
+        
+        NSLog(@"For Key %@ Now is %@, ExpireTime is %@",key, now, expireTime);
+        NSLog(@"Expire time mapping is %@:", _expireTimes);
+        
+        if(expireTime != nil && [expireTime compare:now] == NSOrderedAscending){
+            [self removeFileAndExecuteBlocksForKey:key];
+            object = nil;
+            
+            NSLog(@"Disk cache expired for key: %@", key);
+        }
+        else{
+            if ([[NSFileManager defaultManager] fileExistsAtPath:[fileURL path]]) {
+                @try {
+                    object = [NSKeyedUnarchiver unarchiveObjectWithFile:[fileURL path]];
+                    
+                    
+                    NSLog(@"Disk cache hit for key: %@ , obect: %@", key, object);
+                }
+                @catch (NSException *exception) {
+                    NSError *error = nil;
+                    [[NSFileManager defaultManager] removeItemAtPath:[fileURL path] error:&error];
+                    TMDiskCacheError(error);
+                }
+                
+                [strongSelf setFileModificationDate:now forURL:fileURL];
             }
-            @catch (NSException *exception) {
-                NSError *error = nil;
-                [[NSFileManager defaultManager] removeItemAtPath:[fileURL path] error:&error];
-                TMDiskCacheError(error);
-            }
-
-            [strongSelf setFileModificationDate:now forURL:fileURL];
         }
 
         block(strongSelf, key, object, fileURL);
@@ -459,6 +584,11 @@ NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
 
 - (void)setObject:(id <NSCoding>)object forKey:(NSString *)key block:(TMDiskCacheObjectBlock)block
 {
+    [self setObject:object forKey:key withLifetime:0 block:block];
+}
+
+- (void)setObject:(id <NSCoding>)object forKey:(NSString *)key withLifetime:(NSUInteger)lifetime block:(TMDiskCacheObjectBlock)block
+{
     NSDate *now = [[NSDate alloc] init];
 
     if (!key || !object)
@@ -489,6 +619,16 @@ NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
             NSDictionary *values = [fileURL resourceValuesForKeys:@[ NSURLTotalFileAllocatedSizeKey ] error:&error];
             TMDiskCacheError(error);
 
+            if(lifetime > 0){
+                NSDate *expireTime = [NSDate dateWithTimeIntervalSinceNow:lifetime];
+                [_expireTimes setObject:expireTime forKey:key];
+                bool expireTimeUpdate = [NSKeyedArchiver archiveRootObject:_expireTimes toFile:[_expireTimeFileURL path]];
+                
+                if(_expireTimes.allKeys.count == 1){
+                    [strongSelf trimExpiredObjectsRecursively];
+                }
+            }
+            
             NSNumber *diskFileSize = [values objectForKey:NSURLTotalFileAllocatedSizeKey];
             if (diskFileSize) {
                 [strongSelf->_sizes setObject:diskFileSize forKey:key];
@@ -644,6 +784,9 @@ NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
 
         [strongSelf->_dates removeAllObjects];
         [strongSelf->_sizes removeAllObjects];
+        [strongSelf->_expireTimes removeAllObjects];
+        [NSKeyedArchiver archiveRootObject:_expireTimes toFile:[_expireTimeFileURL path]];
+        
         strongSelf.byteCount = 0; // atomic
 
         if (strongSelf->_didRemoveAllObjectsBlock)
@@ -734,14 +877,19 @@ NSString * const TMDiskCacheSharedName = @"TMDiskCacheShared";
     return fileURLForKey;
 }
 
-- (void)setObject:(id <NSCoding>)object forKey:(NSString *)key
+- (void)setObject:(id<NSCoding>)object forKey:(NSString *)key
+{
+    [self setObject:object forKey:key withLifetime:0];
+}
+
+- (void)setObject:(id <NSCoding>)object forKey:(NSString *)key withLifetime:(NSUInteger)lifetime
 {
     if (!object || !key)
         return;
     
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
 
-    [self setObject:object forKey:key block:^(TMDiskCache *cache, NSString *key, id <NSCoding> object, NSURL *fileURL) {
+    [self setObject:object forKey:key withLifetime:lifetime block:^(TMDiskCache *cache, NSString *key, id <NSCoding> object, NSURL *fileURL) {
         dispatch_semaphore_signal(semaphore);
     }];
 
